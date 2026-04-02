@@ -44,7 +44,7 @@ clap           = { version = "4.5", features = ["derive", "env", "wrap_help"] }
 # Observability
 tracing             = "0.1"
 tracing-subscriber  = { version = "0.3", features = ["env-filter", "json", "fmt"] }
-tracing-opentelemetry = { version = "0.24", optional = true }
+tracing-opentelemetry = { version = "0.24" }
 
 # HTTP (health endpoint)
 axum           = { version = "0.7", features = ["macros"] }
