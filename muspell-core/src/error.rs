@@ -46,9 +46,13 @@ pub enum MuspellError {
     Ed25519(#[from] ed25519_dalek::SignatureError),
 
     // ── Iroh integration ──────────────────────────────────────────────────
-    /// An Iroh node operation failed.
-    #[error("Iroh node error: {0}")]
-    IrohNode(#[from] iroh::client::RpcError),
+    // NOTE: iroh::client::RpcError was removed in iroh 0.28 along with the
+    // entire iroh::client module. Iroh errors are now surfaced as anyhow::Error
+    // from protocol handlers and endpoint operations. We wrap them as strings
+    // here to keep our library error enum self-contained.
+    /// An Iroh endpoint or protocol operation failed.
+    #[error("Iroh error: {0}")]
+    Iroh(String),
 
     /// Could not connect to a peer discovered via KNS.
     #[error("failed to connect to peer '{node_id}': {reason}")]
@@ -90,5 +94,10 @@ impl MuspellError {
                 | MuspellError::PeerConnectionFailed { .. }
                 | MuspellError::BlobSyncFailed { .. }
         )
+    }
+
+    /// Wrap any error that came from an iroh endpoint/protocol call.
+    pub fn iroh(e: impl std::fmt::Display) -> Self {
+        MuspellError::Iroh(e.to_string())
     }
 }
