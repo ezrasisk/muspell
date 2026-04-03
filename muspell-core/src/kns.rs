@@ -13,7 +13,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use backoff::{backoff::Backoff, ExponentialBackoff, ExponentialBackoffBuilder};
+use async_trait::async_trait;
+use backoff::{backoff::Backoff, ExponentialBackoffBuilder};
 use parking_lot::RwLock;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -56,10 +57,13 @@ struct CacheEntry {
 
 // ── Resolver trait ────────────────────────────────────────────────────────────
 
-/// Abstraction over the KNS lookup operation. Implementations include the
-/// real HTTP client and a mock for unit tests.
+/// Abstraction over the KNS lookup operation.
+///
+/// The `#[async_trait]` macro is required because Rust's native async-in-trait
+/// feature (RPITIT) is not yet stable for object-safe traits, and we need
+/// `Box<dyn KnsResolver>` / `mockall` to work.
 #[cfg_attr(test, mockall::automock)]
-#[async_trait::async_trait]
+#[async_trait]
 pub trait KnsResolver: Send + Sync + 'static {
     /// Resolve a KNS name to its associated [`KnsRecord`].
     async fn resolve(&self, name: &str) -> Result<KnsRecord>;
@@ -88,7 +92,8 @@ struct KnsApiRecord {
 /// Production KNS client backed by the Kasplex REST API.
 pub struct KnsClient {
     http: Client,
-    urls: Vec<Url>,           // primary + fallbacks
+    /// Primary URL first, then any fallbacks.
+    urls: Vec<Url>,
     config: KnsConfig,
     cache: Arc<RwLock<HashMap<String, CacheEntry>>>,
 }
@@ -98,8 +103,8 @@ impl KnsClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if the underlying `reqwest` client cannot be built
-    /// (e.g. invalid TLS configuration).
+    /// Returns an error if `reqwest` cannot build an HTTPS-only client
+    /// (e.g. missing TLS backend, which should never happen with `rustls-tls`).
     pub fn new(config: KnsConfig) -> Result<Self> {
         let http = Client::builder()
             .timeout(Duration::from_millis(config.timeout_ms))
@@ -119,16 +124,20 @@ impl KnsClient {
         })
     }
 
-    /// Attempt to fetch a record from a single URL.
+    /// Attempt to fetch a record from a single base URL.
     async fn fetch_from(&self, base: &Url, name: &str) -> Result<KnsRecord> {
-        let url = base
-            .join(&format!("/v1/kns/resolve/{name}"))
-            .map_err(|e| MuspellError::KnsMalformedRecord {
+        // Build the full URL for this specific name.
+        // join() on a base that doesn't end in '/' will replace the last
+        // path segment, so we append manually.
+        let mut url = base.clone();
+        url.path_segments_mut()
+            .map_err(|_| MuspellError::KnsMalformedRecord {
                 name: name.to_string(),
-                reason: e.to_string(),
-            })?;
+                reason: "base URL cannot-be-a-base".to_string(),
+            })?
+            .extend(&["resolve", name]);
 
-        debug!(url = %url, "KNS fetch");
+        debug!(%url, "KNS fetch");
 
         let resp: KnsApiResponse = self
             .http
@@ -160,19 +169,7 @@ impl KnsClient {
         })
     }
 
-    /// Build an exponential-backoff policy from this client's config.
-    fn backoff(&self) -> impl Backoff {
-        ExponentialBackoffBuilder::new()
-            .with_initial_interval(Duration::from_millis(self.config.initial_backoff_ms))
-            .with_max_interval(Duration::from_millis(self.config.max_backoff_ms))
-            .with_max_elapsed_time(Some(
-                Duration::from_millis(self.config.max_backoff_ms)
-                    * (self.config.max_retries + 1) as u32,
-            ))
-            .build()
-    }
-
-    /// Evict expired cache entries (called opportunistically).
+    /// Evict expired cache entries (called opportunistically on every lookup).
     fn evict_expired(&self) {
         let now = Instant::now();
         self.cache
@@ -181,7 +178,7 @@ impl KnsClient {
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait]
 impl KnsResolver for KnsClient {
     /// Resolve `name` by trying each configured URL in turn, with exponential
     /// backoff on transient failures.
@@ -201,16 +198,22 @@ impl KnsResolver for KnsClient {
             }
         }
 
-        // 2. Try each URL with backoff
+        // 2. Try each URL with exponential backoff
         let mut attempts: u32 = 0;
-        let mut backoff = self.backoff();
+        let mut backoff = ExponentialBackoffBuilder::new()
+            .with_initial_interval(Duration::from_millis(self.config.initial_backoff_ms))
+            .with_max_interval(Duration::from_millis(self.config.max_backoff_ms))
+            .with_max_elapsed_time(Some(
+                Duration::from_millis(self.config.max_backoff_ms)
+                    * (self.config.max_retries + 1) as u32,
+            ))
+            .build();
 
         loop {
             for url in &self.urls {
                 attempts += 1;
                 match self.fetch_from(url, name).await {
                     Ok(record) => {
-                        // Store in cache
                         let ttl = Duration::from_secs(self.config.cache_ttl_s);
                         self.cache.write().insert(
                             name.to_string(),
@@ -221,8 +224,8 @@ impl KnsResolver for KnsClient {
                         );
                         return Ok(record);
                     }
+                    // A definitive "not found" should not trigger retry.
                     Err(MuspellError::KnsNotFound { .. }) => {
-                        // Not found is definitive — no point retrying other URLs
                         return Err(MuspellError::KnsNotFound {
                             name: name.to_string(),
                             attempts,
@@ -230,7 +233,7 @@ impl KnsResolver for KnsClient {
                     }
                     Err(e) if e.is_retryable() => {
                         warn!(
-                            url = %url,
+                            %url,
                             attempt = attempts,
                             error = %e,
                             "transient KNS error, will retry"
@@ -242,7 +245,7 @@ impl KnsResolver for KnsClient {
 
             match backoff.next_backoff() {
                 Some(delay) => {
-                    debug!(delay_ms = delay.as_millis(), "KNS backoff");
+                    debug!(delay_ms = delay.as_millis(), "KNS backoff sleeping");
                     tokio::time::sleep(delay).await;
                 }
                 None => {
@@ -267,7 +270,7 @@ mod tests {
             name: name.to_string(),
             iroh_node_id: "a".repeat(64),
             relay_hints: vec![],
-            ownership_proof: "sig==".to_string(),
+            ownership_proof: "c2ln".to_string(), // base64("sig")
             block_height: 1_000_000,
         }
     }
@@ -278,7 +281,7 @@ mod tests {
         let expected = sample_record("alice.kas");
         mock.expect_resolve()
             .withf(|n| n == "alice.kas")
-            .returning(move |_| Ok(sample_record("alice.kas")));
+            .returning(|_| Ok(sample_record("alice.kas")));
 
         let result = mock.resolve("alice.kas").await.unwrap();
         assert_eq!(result.name, expected.name);
@@ -287,11 +290,12 @@ mod tests {
     #[tokio::test]
     async fn mock_resolver_propagates_not_found() {
         let mut mock = MockKnsResolver::new();
-        mock.expect_resolve()
-            .returning(|n| Err(MuspellError::KnsNotFound {
+        mock.expect_resolve().returning(|n| {
+            Err(MuspellError::KnsNotFound {
                 name: n.to_string(),
                 attempts: 5,
-            }));
+            })
+        });
 
         let err = mock.resolve("unknown.kas").await.unwrap_err();
         assert!(matches!(err, MuspellError::KnsNotFound { .. }));
