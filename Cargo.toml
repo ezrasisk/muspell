@@ -7,11 +7,11 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version     = "0.1.0"
-edition     = "2021"
-authors     = ["Muspell Contributors"]
-license     = "MIT OR Apache-2.0"
-repository  = "https://github.com/example/muspell"
+version      = "0.1.0"
+edition      = "2021"
+authors      = ["Muspell Contributors"]
+license      = "MIT OR Apache-2.0"
+repository   = "https://github.com/example/muspell"
 rust-version = "1.79"
 
 # ── Shared dependency versions ────────────────────────────────────────────────
@@ -19,61 +19,70 @@ rust-version = "1.79"
 # Async runtime
 tokio          = { version = "1.38", features = ["full"] }
 tokio-util     = { version = "0.7", features = ["rt"] }
+tokio-stream   = "0.1"
+futures        = "0.3"
 
-# P2P / Iroh
-iroh           = { version = "0.22", features = ["discovery-pkarr-dht"] }
-iroh-blobs     = { version = "0.22" }
-iroh-docs      = { version = "0.22" }
-iroh-gossip    = { version = "0.22" }
+# ── P2P / Iroh ────────────────────────────────────────────────────────────────
+# 0.35 is the production-stable series. The 0.90+ canary versions are NOT
+# recommended for production use per the iroh-blobs maintainers.
+iroh           = "0.35"
+iroh-blobs     = "0.35"
+iroh-gossip    = "0.35"
 
-# Error handling
+# ── Error handling ────────────────────────────────────────────────────────────
 anyhow         = { version = "1.0", features = ["backtrace"] }
 thiserror      = "1.0"
 
-# Serialisation
+# ── Serialisation ─────────────────────────────────────────────────────────────
 serde          = { version = "1.0", features = ["derive"] }
 serde_json     = "1.0"
 toml           = "0.8"
 
-# Configuration
+# ── Configuration ─────────────────────────────────────────────────────────────
 figment        = { version = "0.10", features = ["toml", "env"] }
 
-# CLI
+# ── CLI ───────────────────────────────────────────────────────────────────────
 clap           = { version = "4.5", features = ["derive", "env", "wrap_help"] }
 
-# Observability
+# ── Observability ─────────────────────────────────────────────────────────────
 tracing             = "0.1"
 tracing-subscriber  = { version = "0.3", features = ["env-filter", "json", "fmt"] }
-tracing-opentelemetry = { version = "0.24" }
 
-# HTTP (health endpoint)
+# ── HTTP (health endpoint) ────────────────────────────────────────────────────
 axum           = { version = "0.7", features = ["macros"] }
 tower-http     = { version = "0.5", features = ["trace", "cors"] }
 
-# Retry / backoff
+# ── Retry / backoff ───────────────────────────────────────────────────────────
 backoff        = { version = "0.4", features = ["tokio"] }
 
-# Crypto / hashing
-blake3         = "1.5"
-ed25519-dalek  = { version = "2.1", features = ["serde"] }
+# ── Crypto ────────────────────────────────────────────────────────────────────
+# ed25519-dalek for signing/verifying ownership proofs independent of iroh's
+# internal key types.
+ed25519-dalek  = { version = "2.1", features = ["serde", "rand_core"] }
+hex            = "0.4"
+base64         = "0.22"
 
-# Networking utils
+# ── HTTP client ───────────────────────────────────────────────────────────────
 reqwest        = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 url            = { version = "2.5", features = ["serde"] }
 
-# Concurrency primitives
+# ── Concurrency primitives ────────────────────────────────────────────────────
 dashmap        = "5.5"
 parking_lot    = "0.12"
-tokio-stream   = "0.1"
-futures        = "0.3"
 
-# Time
+# ── Async trait support ───────────────────────────────────────────────────────
+async-trait    = "0.1"
+
+# ── Platform utilities ────────────────────────────────────────────────────────
+dirs           = "5.0"
+
+# ── Time ──────────────────────────────────────────────────────────────────────
 chrono         = { version = "0.4", features = ["serde"] }
-humantime      = "2.1"
 humantime-serde = "1.1"
 
-# Testing
+# ── Testing ───────────────────────────────────────────────────────────────────
 mockall        = "0.12"
+rand           = "0.8"
 
-# Internal crates
+# ── Internal crates ───────────────────────────────────────────────────────────
 muspell-core   = { path = "muspell-core" }
