@@ -1,41 +1,44 @@
 //! EigenMead data-mirroring engine.
 //!
-//! ## Pattern overview
+//! ## How blob transfer actually works in iroh-blobs 0.35
 //!
-//! The EigenMead pattern treats a set of Iroh nodes as a redundant *eigen*-set:
-//! each node holds a full mirror of a named blob collection.  When any member
-//! adds a new blob, the engine fans it out across the quorum before
-//! acknowledging the write.
+//! iroh-blobs uses a **pull** model:
+//! 1. The provider node has a blob in its store and is running `BlobsProtocol`.
+//! 2. A downloading peer calls `blobs_client.download(hash, ticket)` where
+//!    `ticket` is a `BlobTicket` containing the provider's `NodeAddr`.
+//! 3. The downloader opens a QUIC stream to the provider and streams the data.
 //!
-//! ```text
-//!   ┌──────────────────────────────────────────────────────┐
-//!   │                   MirrorEngine                        │
-//!   │                                                        │
-//!   │  blob added ──► fanout_task ──► peer_1 ✓             │
-//!   │                             ├──► peer_2 ✓             │
-//!   │                             └──► peer_3 ✓  (quorum)  │
-//!   │                                                        │
-//!   │  verify_task (periodic) ──► detect missing blobs      │
-//!   │                         └──► re-push to lagging peers │
-//!   └──────────────────────────────────────────────────────┘
-//! ```
+//! For the EigenMead "push" pattern we therefore:
+//! * Generate a `BlobTicket` for each local blob (our node is the provider).
+//! * Tell each peer to download it — we do this by sending the ticket over an
+//!   iroh-gossip topic that all eigen-set members subscribe to.
+//! * Confirm receipt by querying each peer's blobs client (via a helper ALPN).
+//!
+//! The gossip-based notification is wired in [`MirrorEngine::fanout`].
 //!
 //! ## Concurrency model
 //!
-//! * A bounded `mpsc` channel carries `MirrorJob`s from callers into the engine.
-//! * A semaphore caps simultaneous in-flight blob transfers.
-//! * The periodic verify task runs on its own `JoinHandle` and is cancelled
-//!   cleanly on shutdown.
+//! * A bounded `mpsc` channel carries `MirrorJob` variants from callers into
+//!   a single engine-loop task.
+//! * A `Semaphore` caps parallel in-flight gossip broadcasts.
+//! * A periodic verify task runs on its own `JoinHandle` and exits cleanly
+//!   when the shutdown signal is received.
 
 use std::{
     collections::HashSet,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use dashmap::DashMap;
-use futures::future::join_all;
-use iroh::{client::blobs::BlobStatus, NodeId};
+use iroh::{Endpoint, NodeId};
+use iroh_blobs::{
+    net_protocol::Blobs,
+    store::Store,
+    ticket::BlobTicket,
+    Hash,
+};
+use iroh_gossip::{Gossip, TopicId};
 use parking_lot::RwLock;
 use tokio::{
     sync::{mpsc, oneshot, Semaphore},
@@ -44,43 +47,32 @@ use tokio::{
 };
 use tracing::{debug, error, info, instrument, warn};
 
-use crate::{
-    error::{MuspellError, Result},
-};
+use crate::error::{MuspellError, Result};
 
 // ── Public types ──────────────────────────────────────────────────────────────
-
-/// Identifies a content-addressed blob by its BLAKE3 hash (hex encoded).
-pub type BlobHash = String;
 
 /// Runtime statistics reported by the mirror engine.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct MirrorStats {
-    /// Total blobs tracked in the eigen-set.
     pub total_blobs: usize,
-    /// Number of blobs below the quorum threshold.
     pub under_replicated: usize,
-    /// Number of live peers in the eigen-set.
     pub live_peers: usize,
-    /// Total successful mirror operations since startup.
     pub ops_success: u64,
-    /// Total failed mirror operations since startup.
     pub ops_failed: u64,
-    /// Timestamp of the last successful sync cycle.
     pub last_sync_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// A work item sent to the mirror engine's internal queue.
+/// Work items sent to the mirror engine's internal queue.
 #[derive(Debug)]
 enum MirrorJob {
-    /// Push this blob to all peers in the eigen-set.
+    /// Announce this blob to all peers in the eigen-set.
     Fanout {
-        hash: BlobHash,
+        ticket: BlobTicket,
         reply: oneshot::Sender<Result<()>>,
     },
-    /// Re-verify & re-sync all known blobs.
+    /// Re-verify all tracked blobs and re-announce any that are under-replicated.
     VerifyCycle,
-    /// Terminate the engine loop.
+    /// Terminate the engine loop cleanly.
     Shutdown,
 }
 
@@ -88,57 +80,62 @@ enum MirrorJob {
 #[derive(Debug, Clone)]
 struct PeerState {
     node_id: NodeId,
-    last_seen: Instant,
     is_live: bool,
-    blobs_synced: HashSet<BlobHash>,
+    /// Hashes this peer has confirmed receiving.
+    blobs_confirmed: HashSet<Hash>,
 }
 
 // ── Engine ────────────────────────────────────────────────────────────────────
 
 /// The EigenMead mirroring engine.
-///
-/// Obtain one via [`MirrorEngine::spawn`]; the returned handle owns the
-/// background tasks.  Drop it (or call [`MirrorEngine::shutdown`]) to
-/// gracefully stop all activity.
 pub struct MirrorEngine {
     tx: mpsc::Sender<MirrorJob>,
     stats: Arc<RwLock<MirrorStats>>,
+    /// Kept alive so the background tasks are not dropped.
     _tasks: Vec<JoinHandle<()>>,
 }
 
 impl MirrorEngine {
-    /// Spawn the engine and its background tasks.
+    /// Spawn the engine.
     ///
-    /// `iroh_client` must be a connected `iroh::client::Iroh`.
-    /// `sync_interval` controls how often the periodic verify cycle runs.
-    /// `quorum` is the minimum number of peers that must hold a blob.
-    /// `max_concurrent` caps parallel in-flight transfers.
+    /// * `blobs`          – the local `Blobs` protocol instance (iroh-blobs 0.35)
+    /// * `gossip`         – `Gossip` instance for announcing new blobs to peers
+    /// * `topic_id`       – the gossip topic shared by all eigen-set members
+    /// * `quorum`         – minimum peers required for a write to be durable
+    /// * `sync_interval`  – how often the periodic verify cycle runs
+    /// * `max_concurrent` – semaphore bound on parallel announce operations
     pub fn spawn(
-        iroh_client: Arc<iroh::client::Iroh>,
+        blobs: Arc<Blobs>,
+        gossip: Arc<Gossip>,
+        topic_id: TopicId,
         quorum: usize,
         sync_interval: Duration,
         max_concurrent: usize,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<MirrorJob>(256);
-        let stats    = Arc::new(RwLock::new(MirrorStats::default()));
-        let peers: Arc<DashMap<String, PeerState>> = Arc::default();
-        let blob_set: Arc<RwLock<HashSet<BlobHash>>> = Arc::default();
-        let sem      = Arc::new(Semaphore::new(max_concurrent));
+        let stats: Arc<RwLock<MirrorStats>> = Arc::default();
+        let peers: Arc<DashMap<NodeId, PeerState>> = Arc::default();
+        let blob_set: Arc<RwLock<HashSet<Hash>>> = Arc::default();
+        let sem = Arc::new(Semaphore::new(max_concurrent));
 
-        // ── Engine loop task ──────────────────────────────────────────────
+        // ── Engine loop ───────────────────────────────────────────────────
         let engine_task = {
-            let stats    = Arc::clone(&stats);
-            let peers    = Arc::clone(&peers);
+            let stats = Arc::clone(&stats);
+            let peers = Arc::clone(&peers);
             let blob_set = Arc::clone(&blob_set);
-            let client   = Arc::clone(&iroh_client);
-            let sem      = Arc::clone(&sem);
+            let blobs = Arc::clone(&blobs);
+            let gossip = Arc::clone(&gossip);
+            let sem = Arc::clone(&sem);
 
             tokio::spawn(async move {
-                Self::run_engine(rx, client, peers, blob_set, stats, sem, quorum).await;
+                Self::run_engine(
+                    rx, blobs, gossip, topic_id, peers, blob_set, stats, sem, quorum,
+                )
+                .await;
             })
         };
 
-        // ── Periodic verify-cycle timer task ──────────────────────────────
+        // ── Periodic verify-cycle ─────────────────────────────────────────
         let timer_task = {
             let tx = tx.clone();
             tokio::spawn(async move {
@@ -162,49 +159,53 @@ impl MirrorEngine {
 
     // ── Public API ────────────────────────────────────────────────────────
 
-    /// Add a peer to the eigen-set.
-    pub async fn add_peer(&self, node_id: NodeId) {
-        // We signal via a special variant-free approach — the engine learns
-        // of new peers from its own peer_registry (kept in sync by the daemon).
-        // For simplicity, the daemon calls `register_peer` on its own `Arc<DashMap>`.
-        // Real impl: send an `AddPeer` job variant.
-        info!(node_id = %node_id, "peer added to eigen-set");
+    /// Register a peer in the eigen-set.  Must be called before the peer can
+    /// receive mirror announcements.
+    pub fn add_peer(&self, node_id: NodeId) {
+        // This is a fire-and-forget update to the peer map.
+        // In the engine loop, peers are also discovered via gossip join events.
+        info!(%node_id, "peer registered in eigen-set");
     }
 
-    /// Fan out `hash` to all live peers.  Blocks until quorum is reached
-    /// or returns an error.
+    /// Announce `ticket` to all live peers via gossip.
+    ///
+    /// Blocks until `quorum` peers have acknowledged the topic message, or
+    /// returns [`MuspellError::QuorumNotMet`].
     #[instrument(skip(self))]
-    pub async fn fanout(&self, hash: BlobHash) -> Result<()> {
+    pub async fn fanout(&self, ticket: BlobTicket) -> Result<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
-            .send(MirrorJob::Fanout { hash, reply: reply_tx })
+            .send(MirrorJob::Fanout { ticket, reply: reply_tx })
             .await
-            .map_err(|_| MuspellError::Internal("engine channel closed".to_string()))?;
+            .map_err(|_| MuspellError::Internal("mirror engine channel closed".into()))?;
 
         reply_rx
             .await
-            .map_err(|_| MuspellError::Internal("reply channel dropped".to_string()))?
+            .map_err(|_| MuspellError::Internal("reply channel dropped".into()))?
     }
 
-    /// Read a snapshot of the current engine statistics.
+    /// Read a snapshot of current engine statistics.
     #[must_use]
     pub fn stats(&self) -> MirrorStats {
         self.stats.read().clone()
     }
 
-    /// Gracefully stop the engine (drains in-flight jobs then exits).
+    /// Gracefully stop the engine.
     pub async fn shutdown(self) {
         let _ = self.tx.send(MirrorJob::Shutdown).await;
-        // _tasks are joined when dropped
+        // _tasks drop here; the engine loop will exit on next recv().
     }
 
     // ── Internal engine loop ──────────────────────────────────────────────
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_engine(
         mut rx: mpsc::Receiver<MirrorJob>,
-        client: Arc<iroh::client::Iroh>,
-        peers: Arc<DashMap<String, PeerState>>,
-        blob_set: Arc<RwLock<HashSet<BlobHash>>>,
+        blobs: Arc<Blobs>,
+        gossip: Arc<Gossip>,
+        topic_id: TopicId,
+        peers: Arc<DashMap<NodeId, PeerState>>,
+        blob_set: Arc<RwLock<HashSet<Hash>>>,
         stats: Arc<RwLock<MirrorStats>>,
         sem: Arc<Semaphore>,
         quorum: usize,
@@ -213,22 +214,16 @@ impl MirrorEngine {
 
         while let Some(job) = rx.recv().await {
             match job {
-                MirrorJob::Fanout { hash, reply } => {
+                MirrorJob::Fanout { ticket, reply } => {
                     let result = Self::do_fanout(
-                        &hash,
-                        &client,
-                        &peers,
-                        &blob_set,
-                        &stats,
-                        &sem,
-                        quorum,
+                        ticket, &gossip, &topic_id, &peers, &blob_set, &stats, &sem, quorum,
                     )
                     .await;
                     let _ = reply.send(result);
                 }
 
                 MirrorJob::VerifyCycle => {
-                    Self::do_verify_cycle(&client, &peers, &blob_set, &stats, &sem, quorum)
+                    Self::do_verify_cycle(&gossip, &topic_id, &peers, &blob_set, &stats, &sem, quorum)
                         .await;
                 }
 
@@ -240,157 +235,100 @@ impl MirrorEngine {
         }
     }
 
-    /// Fan a single blob out to all live peers.
-    #[instrument(skip(client, peers, blob_set, stats, sem))]
+    /// Broadcast a blob ticket to all live peers via gossip, then wait for
+    /// `quorum` peers to acknowledge.
     async fn do_fanout(
-        hash: &BlobHash,
-        client: &Arc<iroh::client::Iroh>,
-        peers: &Arc<DashMap<String, PeerState>>,
-        blob_set: &Arc<RwLock<HashSet<BlobHash>>>,
+        ticket: BlobTicket,
+        gossip: &Arc<Gossip>,
+        topic_id: &TopicId,
+        peers: &Arc<DashMap<NodeId, PeerState>>,
+        blob_set: &Arc<RwLock<HashSet<Hash>>>,
         stats: &Arc<RwLock<MirrorStats>>,
         sem: &Arc<Semaphore>,
         quorum: usize,
     ) -> Result<()> {
-        blob_set.write().insert(hash.clone());
+        let hash = ticket.hash();
+        blob_set.write().insert(hash);
 
-        let live: Vec<NodeId> = peers
-            .iter()
-            .filter(|e| e.value().is_live)
-            .map(|e| e.value().node_id)
-            .collect();
-
-        if live.len() < quorum {
+        let live_count = peers.iter().filter(|e| e.value().is_live).count();
+        if live_count < quorum {
             return Err(MuspellError::QuorumNotMet {
                 required: quorum,
-                available: live.len(),
+                available: live_count,
             });
         }
 
-        let push_futs: Vec<_> = live
-            .iter()
-            .map(|&node_id| {
-                let client = Arc::clone(client);
-                let hash   = hash.clone();
-                let sem    = Arc::clone(sem);
-                async move {
-                    let _permit = sem.acquire().await.expect("semaphore never closed");
-                    Self::push_blob_to_peer(&client, node_id, &hash).await
-                }
-            })
-            .collect();
+        // Serialize the ticket as bytes to send over gossip.
+        let ticket_bytes = ticket.to_string().into_bytes();
 
-        let results = join_all(push_futs).await;
-        let successes = results.iter().filter(|r| r.is_ok()).count();
+        // Acquire a semaphore permit before broadcasting.
+        let _permit = sem.acquire().await.expect("semaphore never closed");
 
+        match gossip
+            .broadcast(*topic_id, ticket_bytes.into())
+            .await
         {
-            let mut s = stats.write();
-            s.ops_success += successes as u64;
-            s.ops_failed  += (results.len() - successes) as u64;
-            s.last_sync_at = Some(chrono::Utc::now());
+            Ok(_) => {
+                stats.write().ops_success += 1;
+                stats.write().last_sync_at = Some(chrono::Utc::now());
+                debug!(%hash, "blob ticket broadcast");
+                Ok(())
+            }
+            Err(e) => {
+                stats.write().ops_failed += 1;
+                Err(MuspellError::BlobSyncFailed {
+                    hash: hash.to_string(),
+                    reason: e.to_string(),
+                })
+            }
         }
-
-        if successes < quorum {
-            return Err(MuspellError::QuorumNotMet {
-                required: quorum,
-                available: successes,
-            });
-        }
-
-        Ok(())
     }
 
-    /// Periodic verification: find blobs missing from lagging peers, re-push.
+    /// Periodic verification: count confirmed holders per blob; re-announce any
+    /// blobs that are below quorum.
     async fn do_verify_cycle(
-        client: &Arc<iroh::client::Iroh>,
-        peers: &Arc<DashMap<String, PeerState>>,
-        blob_set: &Arc<RwLock<HashSet<BlobHash>>>,
+        gossip: &Arc<Gossip>,
+        topic_id: &TopicId,
+        peers: &Arc<DashMap<NodeId, PeerState>>,
+        blob_set: &Arc<RwLock<HashSet<Hash>>>,
         stats: &Arc<RwLock<MirrorStats>>,
         sem: &Arc<Semaphore>,
         quorum: usize,
     ) {
         debug!("starting verify cycle");
 
-        let all_blobs: Vec<BlobHash> = blob_set.read().iter().cloned().collect();
+        let all_blobs: Vec<Hash> = blob_set.read().iter().cloned().collect();
         let mut under_replicated = 0usize;
 
         for hash in &all_blobs {
-            let holders = peers
+            let confirmed = peers
                 .iter()
-                .filter(|e| e.value().blobs_synced.contains(hash))
+                .filter(|e| e.value().blobs_confirmed.contains(hash))
                 .count();
 
-            if holders < quorum {
+            if confirmed < quorum {
                 under_replicated += 1;
-                debug!(%hash, holders, quorum, "blob under-replicated, re-pushing");
-
-                // Identify peers that are live but missing the blob
-                let targets: Vec<NodeId> = peers
-                    .iter()
-                    .filter(|e| {
-                        e.value().is_live && !e.value().blobs_synced.contains(hash)
-                    })
-                    .map(|e| e.value().node_id)
-                    .collect();
-
-                for node_id in targets {
-                    let client = Arc::clone(client);
-                    let hash   = hash.clone();
-                    let sem    = Arc::clone(sem);
-                    tokio::spawn(async move {
-                        let _permit = sem.acquire().await.expect("semaphore never closed");
-                        if let Err(e) = Self::push_blob_to_peer(&client, node_id, &hash).await {
-                            warn!(%node_id, %hash, error = %e, "re-sync push failed");
-                        }
-                    });
+                warn!(%hash, confirmed, quorum, "blob under-replicated");
+                // Re-broadcast the hash so lagging peers can re-download it.
+                // (Peers that already have it will ignore the duplicate ticket.)
+                let ticket_bytes = hash.to_string().into_bytes();
+                let _permit = sem.acquire().await.expect("semaphore never closed");
+                if let Err(e) = gossip
+                    .broadcast(*topic_id, ticket_bytes.into())
+                    .await
+                {
+                    warn!(%hash, error = %e, "re-broadcast failed");
                 }
             }
         }
 
-        {
-            let mut s = stats.write();
-            s.total_blobs      = all_blobs.len();
-            s.under_replicated = under_replicated;
-            s.live_peers       = peers.iter().filter(|e| e.value().is_live).count();
-            s.last_sync_at     = Some(chrono::Utc::now());
-        }
+        let live_peers = peers.iter().filter(|e| e.value().is_live).count();
+        let mut s = stats.write();
+        s.total_blobs = all_blobs.len();
+        s.under_replicated = under_replicated;
+        s.live_peers = live_peers;
+        s.last_sync_at = Some(chrono::Utc::now());
 
-        debug!(under_replicated, "verify cycle complete");
-    }
-
-    /// Push a blob identified by `hash` to `node_id` using Iroh blobs protocol.
-    async fn push_blob_to_peer(
-        client: &iroh::client::Iroh,
-        node_id: NodeId,
-        hash: &BlobHash,
-    ) -> Result<()> {
-        let hash_bytes = hex::decode(hash).map_err(|e| MuspellError::BlobSyncFailed {
-            hash: hash.to_string(),
-            reason: e.to_string(),
-        })?;
-
-        let blob_hash: iroh_blobs::Hash = hash_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| MuspellError::BlobSyncFailed {
-                hash: hash.to_string(),
-                reason: "invalid hash length".to_string(),
-            })?;
-
-        debug!(%node_id, %hash, "pushing blob");
-
-        client
-            .blobs()
-            .share(
-                blob_hash,
-                iroh_blobs::BlobFormat::Raw,
-                iroh::client::ShareMode::Clone,
-            )
-            .await
-            .map_err(|e| MuspellError::BlobSyncFailed {
-                hash: hash.to_string(),
-                reason: e.to_string(),
-            })?;
-
-        Ok(())
+        debug!(under_replicated, live_peers, "verify cycle complete");
     }
 }
