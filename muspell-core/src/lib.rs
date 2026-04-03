@@ -1,27 +1,31 @@
 //! # muspell-core
 //!
 //! Production-grade library providing:
-//! * KNS (Kaspa Name Service) discovery for Iroh node IDs
-//! * EigenMead-pattern data mirroring across discovered peers
-//! * Cryptographic ownership validation to prevent node spoofing
+//! * KNS (Kaspa Name Service) resolution for Iroh `NodeId`s
+//! * `StaticDiscovery`-backed peer injection (the recommended iroh 0.35 pattern
+//!   for side-channel address provisioning)
+//! * Ed25519 ownership-proof validation to prevent node spoofing
+//! * EigenMead data mirroring via iroh-blobs + iroh-gossip
 //!
 //! ## Architecture overview
 //!
 //! ```text
-//! ┌─────────────────────────────────────────────────────────┐
-//! │                     muspell-core                         │
-//! │                                                          │
-//! │  ┌───────────────┐    ┌───────────────────────────────┐  │
-//! │  │  KnsResolver  │───▶│     DiscoveryProvider         │  │
-//! │  │  (RPC client) │    │  (Iroh Discovery trait impl)  │  │
-//! │  └───────────────┘    └───────────────────────────────┘  │
-//! │          │                         │                     │
-//! │          ▼                         ▼                     │
-//! │  ┌───────────────┐    ┌───────────────────────────────┐  │
-//! │  │  OwnershipVal │    │     MirrorEngine (EigenMead)  │  │
-//! │  │  (ed25519)    │    │    blob-sync + gossip fanout  │  │
-//! │  └───────────────┘    └───────────────────────────────┘  │
-//! └─────────────────────────────────────────────────────────┘
+//! ┌──────────────────────────────────────────────────────────┐
+//! │                      muspell-core                         │
+//! │                                                           │
+//! │  ┌──────────────┐   ┌────────────────────────────────┐   │
+//! │  │  KnsClient   │──▶│   KnsDiscoveryProvider         │   │
+//! │  │  (reqwest +  │   │   wraps iroh::StaticDiscovery  │   │
+//! │  │   backoff)   │   │   injects NodeAddr on resolve  │   │
+//! │  └──────────────┘   └───────────────┬────────────────┘   │
+//! │          │                          │                     │
+//! │          ▼                          ▼                     │
+//! │  ┌──────────────┐   ┌────────────────────────────────┐   │
+//! │  │  Ownership   │   │   MirrorEngine  (EigenMead)    │   │
+//! │  │  Validator   │   │   BlobTicket gossip fanout     │   │
+//! │  │  (ed25519)   │   │   + periodic quorum verify     │   │
+//! │  └──────────────┘   └────────────────────────────────┘   │
+//! └──────────────────────────────────────────────────────────┘
 //! ```
 
 #![forbid(unsafe_code)]
@@ -41,11 +45,11 @@ pub mod mirror;
 pub mod node;
 pub mod security;
 
-// Convenient top-level re-exports consumed by daemon / CLI
+// Convenient top-level re-exports consumed by daemon / CLI.
 pub use config::MuspellConfig;
 pub use discovery::KnsDiscoveryProvider;
 pub use error::{MuspellError, Result};
-pub use kns::{KnsClient, KnsRecord};
+pub use kns::{KnsClient, KnsRecord, KnsResolver};
 pub use mirror::{MirrorEngine, MirrorStats};
 pub use node::MuspellNode;
 pub use security::OwnershipValidator;
